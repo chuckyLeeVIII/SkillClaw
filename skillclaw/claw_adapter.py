@@ -5,6 +5,8 @@ Claw adapter: auto-configures the active CLI agent to use the SkillClaw proxy.
 Supported agents:
   openclaw  — runs `openclaw config set …` + `openclaw gateway restart`
   hermes    — patches ~/.hermes/config.yaml to point model traffic at SkillClaw
+  codex     — patches ~/.codex/config.toml to register SkillClaw as a provider
+  claude    — patches ~/.claude/settings.json to route Anthropic traffic via SkillClaw
   qwenpaw   — patches QwenPaw model config, selects SkillClaw as active model
   ironclaw  — patches ~/.ironclaw/.env, runs `ironclaw service restart`
   picoclaw  — patches ~/.picoclaw/config.json model_list, runs `picoclaw gateway restart`
@@ -40,6 +42,14 @@ _LEGACY_SKILLCLAW_SKILLS_DIR = Path.home() / ".skillclaw" / "skills"
 _HERMES_HOME = Path.home() / ".hermes"
 _HERMES_SKILLS_DIR = _HERMES_HOME / "skills"
 _HERMES_BACKUP_DIR = Path.home() / ".skillclaw" / "backups" / "hermes"
+_CODEX_HOME = Path.home() / ".codex"
+_CODEX_CONFIG_PATH = _CODEX_HOME / "config.toml"
+_CODEX_SKILLS_DIR = _CODEX_HOME / "skills"
+_CODEX_BACKUP_DIR = Path.home() / ".skillclaw" / "backups" / "codex"
+_CLAUDE_HOME = Path.home() / ".claude"
+_CLAUDE_SETTINGS_PATH = _CLAUDE_HOME / "settings.json"
+_CLAUDE_SKILLS_DIR = _CLAUDE_HOME / "skills"
+_CLAUDE_BACKUP_DIR = Path.home() / ".skillclaw" / "backups" / "claude"
 
 
 # ------------------------------------------------------------------ #
@@ -200,42 +210,203 @@ def _write_text_atomic(path: Path, text: str, label: str) -> None:
             tmp_path.unlink(missing_ok=True)
 
 
-def _backup_hermes_config_if_changed(config_path: Path, new_text: str) -> Path | None:
-    """Save the current Hermes config before overwriting it, if it changed."""
-    if not config_path.exists():
+def _backup_text_file_if_changed(
+    path: Path,
+    new_text: str,
+    *,
+    backup_dir: Path,
+    backup_stem: str,
+    backup_suffix: str,
+    label: str,
+) -> Path | None:
+    """Save a timestamped backup before overwriting a text file."""
+    if not path.exists():
         return None
 
     try:
-        current_text = config_path.read_text(encoding="utf-8")
+        current_text = path.read_text(encoding="utf-8")
     except Exception as e:
-        logger.warning("[ClawAdapter] Failed to read Hermes config for backup: %s", e)
+        logger.warning("[ClawAdapter] Failed to read %s for backup: %s", path, e)
         return None
 
     if current_text == new_text:
         return None
 
-    _HERMES_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    backup_path = _HERMES_BACKUP_DIR / f"config.{timestamp}.yaml"
-    latest_path = _HERMES_BACKUP_DIR / "config.latest.yaml"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_path = backup_dir / f"{backup_stem}.{timestamp}.{backup_suffix}"
+    latest_path = backup_dir / f"{backup_stem}.latest.{backup_suffix}"
     try:
         backup_path.write_text(current_text, encoding="utf-8")
         latest_path.write_text(current_text, encoding="utf-8")
-        logger.info("[ClawAdapter] Hermes config backup saved: %s", backup_path)
+        logger.info("[ClawAdapter] %s backup saved: %s", label, backup_path)
         return backup_path
     except Exception as e:
-        logger.warning("[ClawAdapter] Failed to save Hermes config backup: %s", e)
+        logger.warning("[ClawAdapter] Failed to save %s backup: %s", label, e)
         return None
+
+
+def _latest_backup_path(backup_dir: Path, backup_stem: str, backup_suffix: str) -> Path | None:
+    latest_path = backup_dir / f"{backup_stem}.latest.{backup_suffix}"
+    if latest_path.exists():
+        return latest_path
+    if not backup_dir.is_dir():
+        return None
+    backups = sorted(backup_dir.glob(f"{backup_stem}.*.{backup_suffix}"))
+    return backups[-1] if backups else None
+
+
+def _format_toml_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _parse_toml_value(raw: str) -> object:
+    value = raw.strip()
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        try:
+            return json.loads(value)
+        except Exception:
+            return value[1:-1]
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    return value
+
+
+def _upsert_top_level_toml_keys(text: str, updates: dict[str, object]) -> str:
+    """Update simple top-level TOML assignments before the first table."""
+    lines = text.splitlines()
+    first_table_index = len(lines)
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            first_table_index = idx
+            break
+
+    preamble = lines[:first_table_index]
+    remainder = lines[first_table_index:]
+    seen: set[str] = set()
+    updated_preamble: list[str] = []
+
+    for line in preamble:
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            updated_preamble.append(line)
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key in updates:
+            updated_preamble.append(f"{key} = {_format_toml_value(updates[key])}")
+            seen.add(key)
+            continue
+        updated_preamble.append(line)
+
+    missing_keys = [key for key in updates if key not in seen]
+    if missing_keys:
+        if updated_preamble and updated_preamble[-1].strip():
+            updated_preamble.append("")
+        for key in missing_keys:
+            updated_preamble.append(f"{key} = {_format_toml_value(updates[key])}")
+        if remainder:
+            updated_preamble.append("")
+
+    merged = updated_preamble + remainder
+    return "\n".join(merged).rstrip() + "\n"
+
+
+def _remove_toml_table(text: str, table_name: str) -> str:
+    """Remove a TOML table and its body, if present."""
+    lines = text.splitlines()
+    kept: list[str] = []
+    skipping = False
+    target_header = f"[{table_name}]"
+
+    for line in lines:
+        stripped = line.strip()
+        is_header = stripped.startswith("[") and stripped.endswith("]")
+        if is_header:
+            if skipping:
+                skipping = False
+            if stripped == target_header:
+                skipping = True
+                continue
+        if skipping:
+            continue
+        kept.append(line)
+
+    return "\n".join(kept).rstrip() + "\n"
+
+
+def _extract_toml_table(text: str, table_name: str) -> dict[str, object]:
+    """Extract simple key/value pairs from a TOML table."""
+    result: dict[str, object] = {}
+    lines = text.splitlines()
+    target_header = f"[{table_name}]"
+    inside = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if inside:
+                break
+            inside = stripped == target_header
+            continue
+        if not inside or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, raw_value = stripped.split("=", 1)
+        result[key.strip()] = _parse_toml_value(raw_value)
+    return result
+
+
+def _extract_top_level_toml_value(text: str, key: str) -> object | None:
+    """Read a simple top-level TOML assignment before the first table."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            break
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        current_key, raw_value = stripped.split("=", 1)
+        if current_key.strip() == key:
+            return _parse_toml_value(raw_value)
+    return None
+
+
+def _prepare_external_skills_dir(target_dir: Path, label: str) -> None:
+    """Prepare an agent-native skill directory without overwriting existing skills."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    if not _LEGACY_SKILLCLAW_SKILLS_DIR.is_dir():
+        return
+
+    migrated = _copy_missing_skill_dirs(_LEGACY_SKILLCLAW_SKILLS_DIR, target_dir)
+    if migrated > 0:
+        logger.info(
+            "[ClawAdapter] migrated %d legacy SkillClaw skill(s) into %s skills dir",
+            migrated,
+            label,
+        )
+
+
+def _backup_hermes_config_if_changed(config_path: Path, new_text: str) -> Path | None:
+    """Save the current Hermes config before overwriting it, if it changed."""
+    return _backup_text_file_if_changed(
+        config_path,
+        new_text,
+        backup_dir=_HERMES_BACKUP_DIR,
+        backup_stem="config",
+        backup_suffix="yaml",
+        label="Hermes config",
+    )
 
 
 def _latest_hermes_backup_path() -> Path | None:
-    latest_path = _HERMES_BACKUP_DIR / "config.latest.yaml"
-    if latest_path.exists():
-        return latest_path
-    if not _HERMES_BACKUP_DIR.is_dir():
-        return None
-    backups = sorted(_HERMES_BACKUP_DIR.glob("config.*.yaml"))
-    return backups[-1] if backups else None
+    return _latest_backup_path(_HERMES_BACKUP_DIR, "config", "yaml")
 
 
 def _write_json_mapping_atomic(path: Path, data: dict, label: str) -> None:
@@ -414,6 +585,279 @@ def _copy_missing_skill_dirs(src_root: Path, dst_root: Path) -> int:
         shutil.copytree(entry, dst_dir)
         copied += 1
     return copied
+
+
+# ------------------------------------------------------------------ #
+# Codex adapter                                                       #
+# ------------------------------------------------------------------ #
+
+def _backup_codex_config_if_changed(config_path: Path, new_text: str) -> Path | None:
+    return _backup_text_file_if_changed(
+        config_path,
+        new_text,
+        backup_dir=_CODEX_BACKUP_DIR,
+        backup_stem="config",
+        backup_suffix="toml",
+        label="Codex config",
+    )
+
+
+def _latest_codex_backup_path() -> Path | None:
+    return _latest_backup_path(_CODEX_BACKUP_DIR, "config", "toml")
+
+
+def _build_codex_provider_block(base_url: str, api_key: str) -> str:
+    lines = [
+        "[model_providers.skillclaw]",
+        'name = "SkillClaw"',
+        f"base_url = {_format_toml_value(base_url)}",
+        'wire_api = "responses"',
+        f"experimental_bearer_token = {_format_toml_value(api_key)}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _configure_codex(cfg: "SkillClawConfig") -> None:
+    """Auto-configure Codex CLI to use the SkillClaw proxy."""
+    model_id = cfg.served_model_name or cfg.llm_model_id or "skillclaw-model"
+    api_key = cfg.proxy_api_key or "skillclaw"
+    base_url = f"http://127.0.0.1:{cfg.proxy_port}/v1"
+    config_path = _CODEX_CONFIG_PATH
+    _prepare_external_skills_dir(_CODEX_SKILLS_DIR, "Codex")
+
+    existing_text = ""
+    if config_path.exists():
+        try:
+            existing_text = config_path.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.warning("[ClawAdapter] Failed to read Codex config %s: %s", config_path, e)
+
+    updated = _upsert_top_level_toml_keys(
+        existing_text,
+        {
+            "model": model_id,
+            "model_provider": "skillclaw",
+        },
+    )
+    updated = _remove_toml_table(updated, "model_providers.skillclaw").rstrip() + "\n\n"
+    updated += _build_codex_provider_block(base_url, api_key)
+
+    _backup_codex_config_if_changed(config_path, updated)
+    _write_text_atomic(config_path, updated, "Codex config")
+
+
+def inspect_codex_config(cfg: "SkillClawConfig") -> dict[str, object]:
+    """Return a diagnostic snapshot of the local Codex integration state."""
+    config_path = _CODEX_CONFIG_PATH
+    expected_model = cfg.served_model_name or cfg.llm_model_id or "skillclaw-model"
+    expected_base_url = f"http://127.0.0.1:{cfg.proxy_port}/v1"
+    expected_api_key = cfg.proxy_api_key or "skillclaw"
+    expected_skills_dir = _CODEX_SKILLS_DIR
+    configured_skillclaw_skills_dir = Path(
+        str(getattr(cfg, "skills_dir", "") or expected_skills_dir),
+    ).expanduser()
+
+    text = ""
+    if config_path.exists():
+        try:
+            text = config_path.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.warning("[ClawAdapter] Failed to read Codex config %s: %s", config_path, e)
+
+    configured_model = str(_extract_top_level_toml_value(text, "model") or "")
+    configured_provider = str(_extract_top_level_toml_value(text, "model_provider") or "")
+    provider_cfg = _extract_toml_table(text, "model_providers.skillclaw")
+    configured_base_url = str(provider_cfg.get("base_url") or "")
+    configured_wire_api = str(provider_cfg.get("wire_api") or "")
+    configured_token = str(provider_cfg.get("experimental_bearer_token") or "")
+
+    proxy_match = (
+        configured_model == expected_model
+        and configured_provider == "skillclaw"
+        and configured_base_url == expected_base_url
+        and configured_wire_api == "responses"
+        and configured_token == expected_api_key
+    )
+
+    backup_path = _latest_codex_backup_path()
+    skills_dir_match = configured_skillclaw_skills_dir == expected_skills_dir
+    issues: list[str] = []
+    notes: list[str] = [
+        "Codex uses the OpenAI Responses-compatible SkillClaw endpoint via `model_providers.skillclaw`.",
+        "Codex session boundaries fall back to proxy-side heuristics because Codex does not send SkillClaw session headers.",
+    ]
+    next_steps: list[str] = []
+
+    if not config_path.exists():
+        issues.append("Codex config is missing: ~/.codex/config.toml")
+    if not proxy_match:
+        issues.append("Codex model routing is not pointing at the local SkillClaw proxy.")
+        next_steps.append("Start SkillClaw once with `claw_type=codex` so it can rewrite ~/.codex/config.toml.")
+    if not expected_skills_dir.is_dir():
+        issues.append(f"Codex skills directory is missing: {expected_skills_dir}")
+        next_steps.append(f"Create or prepare the Codex skills directory: {expected_skills_dir}")
+    if not skills_dir_match:
+        issues.append(
+            f"SkillClaw is configured to evolve skills in {configured_skillclaw_skills_dir}, "
+            f"but Codex reads skills from {expected_skills_dir}."
+        )
+        next_steps.append(f"Set `skills.dir` to {expected_skills_dir} when using the Codex integration.")
+    if not backup_path:
+        next_steps.append("Run SkillClaw once before relying on `skillclaw restore codex`, so a backup can be created.")
+
+    return {
+        "status": "ok" if not issues else "warning",
+        "config_path": str(config_path),
+        "config_exists": config_path.exists(),
+        "integration_scope": "codex-only",
+        "expected_model": expected_model,
+        "configured_model": configured_model or "(unset)",
+        "expected_base_url": expected_base_url,
+        "configured_base_url": configured_base_url or "(unset)",
+        "configured_provider": configured_provider or "(unset)",
+        "proxy_match": proxy_match,
+        "expected_skills_dir": str(expected_skills_dir),
+        "skills_dir_exists": expected_skills_dir.is_dir(),
+        "skills_dir_mode": "codex-default" if skills_dir_match else "custom",
+        "configured_skillclaw_skills_dir": str(configured_skillclaw_skills_dir),
+        "configured_wire_api": configured_wire_api or "(unset)",
+        "latest_backup": str(backup_path) if backup_path else "(none)",
+        "session_boundary_mode": "proxy heuristics",
+        "issues": issues,
+        "notes": notes,
+        "next_steps": next_steps,
+    }
+
+
+def restore_codex_config(backup_path: Path | None = None) -> dict[str, str]:
+    """Restore ~/.codex/config.toml from the latest or a specified backup."""
+    source = Path(backup_path).expanduser() if backup_path is not None else _latest_codex_backup_path()
+    if source is None or not source.exists():
+        raise FileNotFoundError("No Codex backup found")
+
+    text = source.read_text(encoding="utf-8")
+    target = _CODEX_CONFIG_PATH
+    _write_text_atomic(target, text, "Codex config restore")
+    return {"source": str(source), "target": str(target)}
+
+
+# ------------------------------------------------------------------ #
+# Claude Code adapter                                                 #
+# ------------------------------------------------------------------ #
+
+def _backup_claude_settings_if_changed(settings_path: Path, new_text: str) -> Path | None:
+    return _backup_text_file_if_changed(
+        settings_path,
+        new_text,
+        backup_dir=_CLAUDE_BACKUP_DIR,
+        backup_stem="settings",
+        backup_suffix="json",
+        label="Claude Code settings",
+    )
+
+
+def _latest_claude_backup_path() -> Path | None:
+    return _latest_backup_path(_CLAUDE_BACKUP_DIR, "settings", "json")
+
+
+def _configure_claude(cfg: "SkillClawConfig") -> None:
+    """Auto-configure Claude Code to use the SkillClaw proxy."""
+    settings_path = _CLAUDE_SETTINGS_PATH
+    api_key = cfg.proxy_api_key or "skillclaw"
+    base_url = f"http://127.0.0.1:{cfg.proxy_port}"
+    _prepare_external_skills_dir(_CLAUDE_SKILLS_DIR, "Claude Code")
+
+    data = _load_json_mapping(settings_path, "Claude Code")
+    env = data.get("env")
+    if not isinstance(env, dict):
+        env = {}
+    env["ANTHROPIC_BASE_URL"] = base_url
+    env["ANTHROPIC_AUTH_TOKEN"] = api_key
+    data["env"] = env
+
+    new_text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    _backup_claude_settings_if_changed(settings_path, new_text)
+    _write_text_atomic(settings_path, new_text, "Claude Code settings")
+
+
+def inspect_claude_config(cfg: "SkillClawConfig") -> dict[str, object]:
+    """Return a diagnostic snapshot of the local Claude Code integration state."""
+    settings_path = _CLAUDE_SETTINGS_PATH
+    expected_base_url = f"http://127.0.0.1:{cfg.proxy_port}"
+    expected_api_key = cfg.proxy_api_key or "skillclaw"
+    expected_skills_dir = _CLAUDE_SKILLS_DIR
+    configured_skillclaw_skills_dir = Path(
+        str(getattr(cfg, "skills_dir", "") or expected_skills_dir),
+    ).expanduser()
+
+    data = _load_json_mapping(settings_path, "Claude Code")
+    env = data.get("env") if isinstance(data.get("env"), dict) else {}
+    configured_base_url = str(env.get("ANTHROPIC_BASE_URL", "") or "")
+    configured_token = str(env.get("ANTHROPIC_AUTH_TOKEN", "") or "")
+    configured_model = str(data.get("model", "") or "")
+    proxy_match = (
+        configured_base_url == expected_base_url
+        and configured_token == expected_api_key
+    )
+
+    backup_path = _latest_claude_backup_path()
+    skills_dir_match = configured_skillclaw_skills_dir == expected_skills_dir
+    issues: list[str] = []
+    notes: list[str] = [
+        "Claude Code uses SkillClaw through `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` in ~/.claude/settings.json.",
+        "Claude Code session boundaries fall back to proxy-side heuristics because Claude Code does not send SkillClaw session headers.",
+    ]
+    next_steps: list[str] = []
+
+    if not settings_path.exists():
+        issues.append("Claude Code settings are missing: ~/.claude/settings.json")
+    if not proxy_match:
+        issues.append("Claude Code is not pointing at the local SkillClaw proxy.")
+        next_steps.append("Start SkillClaw once with `claw_type=claude` so it can rewrite ~/.claude/settings.json.")
+    if not expected_skills_dir.is_dir():
+        issues.append(f"Claude Code skills directory is missing: {expected_skills_dir}")
+        next_steps.append(f"Create or prepare the Claude Code skills directory: {expected_skills_dir}")
+    if not skills_dir_match:
+        issues.append(
+            f"SkillClaw is configured to evolve skills in {configured_skillclaw_skills_dir}, "
+            f"but Claude Code reads skills from {expected_skills_dir}."
+        )
+        next_steps.append(f"Set `skills.dir` to {expected_skills_dir} when using the Claude Code integration.")
+    if not backup_path:
+        next_steps.append("Run SkillClaw once before relying on `skillclaw restore claude`, so a backup can be created.")
+
+    return {
+        "status": "ok" if not issues else "warning",
+        "config_path": str(settings_path),
+        "config_exists": settings_path.exists(),
+        "integration_scope": "claude-only",
+        "configured_model": configured_model or "(unset)",
+        "expected_base_url": expected_base_url,
+        "configured_base_url": configured_base_url or "(unset)",
+        "configured_provider": "anthropic-env",
+        "proxy_match": proxy_match,
+        "expected_skills_dir": str(expected_skills_dir),
+        "skills_dir_exists": expected_skills_dir.is_dir(),
+        "skills_dir_mode": "claude-default" if skills_dir_match else "custom",
+        "configured_skillclaw_skills_dir": str(configured_skillclaw_skills_dir),
+        "latest_backup": str(backup_path) if backup_path else "(none)",
+        "session_boundary_mode": "proxy heuristics",
+        "issues": issues,
+        "notes": notes,
+        "next_steps": next_steps,
+    }
+
+
+def restore_claude_config(backup_path: Path | None = None) -> dict[str, str]:
+    """Restore ~/.claude/settings.json from the latest or a specified backup."""
+    source = Path(backup_path).expanduser() if backup_path is not None else _latest_claude_backup_path()
+    if source is None or not source.exists():
+        raise FileNotFoundError("No Claude Code backup found")
+
+    text = source.read_text(encoding="utf-8")
+    target = _CLAUDE_SETTINGS_PATH
+    _write_text_atomic(target, text, "Claude Code settings restore")
+    return {"source": str(source), "target": str(target)}
 
 
 # ------------------------------------------------------------------ #
@@ -932,6 +1376,8 @@ def _configure_none(cfg: "SkillClawConfig") -> None:
 _ADAPTERS: dict[str, Callable[["SkillClawConfig"], None]] = {
     "openclaw": _configure_openclaw,
     "hermes": _configure_hermes,
+    "codex": _configure_codex,
+    "claude": _configure_claude,
     "qwenpaw": _configure_qwenpaw,
     "ironclaw": _configure_ironclaw,
     "picoclaw": _configure_picoclaw,

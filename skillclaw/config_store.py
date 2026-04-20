@@ -16,6 +16,8 @@ CONFIG_DIR = Path.home() / ".skillclaw"
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
 _DEFAULT_SKILLS_DIR = CONFIG_DIR / "skills"
 _DEFAULT_HERMES_SKILLS_DIR = Path.home() / ".hermes" / "skills"
+_DEFAULT_CODEX_SKILLS_DIR = Path.home() / ".codex" / "skills"
+_DEFAULT_CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
 
 _DEFAULTS: dict = {
     "llm": {
@@ -140,23 +142,28 @@ def default_skills_dir_for_claw(claw_type: str) -> Path:
     normalized = str(claw_type or "").strip().lower()
     if normalized == "hermes":
         return _DEFAULT_HERMES_SKILLS_DIR
+    if normalized == "codex":
+        return _DEFAULT_CODEX_SKILLS_DIR
+    if normalized == "claude":
+        return _DEFAULT_CLAUDE_SKILLS_DIR
     return _DEFAULT_SKILLS_DIR
 
 
 def resolve_skills_dir(skills_dir: Any, *, claw_type: str) -> str:
-    """Normalize a configured skills dir, applying Hermes-aware defaults.
+    """Normalize a configured skills dir, applying agent-native defaults.
 
     Existing configs that still point at the old generic default are treated as
-    "unset" when Hermes is selected so SkillClaw follows Hermes' own skill
-    library by default.
+    "unset" when an agent with a native skill directory is selected so
+    SkillClaw follows that agent's own skill library by default.
     """
     raw = str(skills_dir or "").strip()
     generic_default = _DEFAULT_SKILLS_DIR.expanduser()
+    normalized_claw = str(claw_type or "").strip().lower()
 
     if raw:
         expanded = Path(raw).expanduser()
-        if str(claw_type or "").strip().lower() == "hermes" and expanded == generic_default:
-            return str(default_skills_dir_for_claw("hermes"))
+        if normalized_claw in {"hermes", "codex", "claude"} and expanded == generic_default:
+            return str(default_skills_dir_for_claw(normalized_claw))
         return str(expanded)
 
     return str(default_skills_dir_for_claw(claw_type))

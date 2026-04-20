@@ -208,6 +208,16 @@ class SetupWizard:
                 "Hermes shares its local skill library with SkillClaw by default.\n"
                 f"Recommended directory: {default_skills_dir}"
             )
+        elif claw_type == "codex":
+            print(
+                "Codex reads native skills from ~/.codex/skills.\n"
+                f"Recommended directory: {default_skills_dir}"
+            )
+        elif claw_type == "claude":
+            print(
+                "Claude Code reads native skills from ~/.claude/skills.\n"
+                f"Recommended directory: {default_skills_dir}"
+            )
         skills_enabled = _prompt_bool(
             "Enable skill injection", default=current_skills.get("enabled", True)
         )

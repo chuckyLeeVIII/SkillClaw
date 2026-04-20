@@ -41,7 +41,7 @@
 </tr>
 <tr>
 <td>🔌 <b>Broad Compatibility</b></td>
-<td>Natively integrates with <a href="https://github.com/NousResearch/hermes-agent">Hermes</a>, <a href="https://github.com/openclaw/openclaw">OpenClaw</a>, <a href="https://github.com/agentscope-ai/QwenPaw">QwenPaw</a>, <a href="https://github.com/nearai/ironclaw">IronClaw</a>, <a href="https://github.com/sipeed/picoclaw">PicoClaw</a>, <a href="https://github.com/zeroclaw-labs/zeroclaw">ZeroClaw</a>, <a href="https://github.com/qwibitai/NanoClaw">NanoClaw</a>, <a href="https://github.com/NVIDIA/NemoClaw">NemoClaw</a>, and any OpenAI-compatible API.</td>
+<td>Natively integrates with <a href="https://github.com/NousResearch/hermes-agent">Hermes</a>, <a href="https://github.com/openai/codex">Codex</a>, <a href="https://docs.anthropic.com/en/docs/claude-code">Claude Code</a>, <a href="https://github.com/openclaw/openclaw">OpenClaw</a>, <a href="https://github.com/agentscope-ai/QwenPaw">QwenPaw</a>, <a href="https://github.com/nearai/ironclaw">IronClaw</a>, <a href="https://github.com/sipeed/picoclaw">PicoClaw</a>, <a href="https://github.com/zeroclaw-labs/zeroclaw">ZeroClaw</a>, <a href="https://github.com/qwibitai/NanoClaw">NanoClaw</a>, <a href="https://github.com/NVIDIA/NemoClaw">NemoClaw</a>, and any OpenAI-compatible API.</td>
 </tr>
 <tr>
 <td>🧬 <b>Collective Skill Evolution</b></td>
@@ -208,7 +208,7 @@ The setup wizard prompts for the provider, model, local skills directory, PRM se
 For a minimal first run:
 
 - choose `none` for the CLI agent if you do not want SkillClaw to auto-configure an external agent yet
-- local skills at `~/.skillclaw/skills` for the generic setup path; if you choose Hermes, the default local library becomes `~/.hermes/skills`
+- local skills at `~/.skillclaw/skills` for the generic setup path; if you choose Hermes, Codex, or Claude Code, the default local library becomes `~/.hermes/skills`, `~/.codex/skills`, or `~/.claude/skills`
 - disable shared storage if you only want to use the local proxy first
 - enable local shared storage only if you want to add the evolve server later on the same machine, and use a dedicated root such as `~/.skillclaw/local-share`
 - disable PRM if you want the cheapest first pass
